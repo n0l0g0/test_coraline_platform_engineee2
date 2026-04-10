@@ -3,6 +3,14 @@
 
 ออกแบบ architecture และ CI/CD pipeline สำหรับระบบ web application ภายในองค์กร ที่เชื่อมต่อกับแหล่งข้อมูลหลายประเภทและแสดงผลผ่านหน้าเว็บ รองรับ environment dev / staging / prod และเชื่อมต่อกับระบบภายนอกได้
 
+### เอกสารที่เกี่ยวข้อง
+
+| ไฟล์ | เนื้อหา |
+|------|---------|
+| [architecture.md](architecture.md) | Architecture diagram + security layers + traffic flow |
+| [cicd-pipeline.md](cicd-pipeline.md) | CI/CD pipeline flow + blue/green deployment + branch strategy |
+| [.github/workflows/ci-cd.yml](.github/workflows/ci-cd.yml) | GitHub Actions workflow จริง |
+
 ---
 
 ## 1. ภาพรวม Architecture
