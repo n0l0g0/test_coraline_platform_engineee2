@@ -1,0 +1,286 @@
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches:
+      - main
+      - "feature/**"
+    tags:
+      - "v*.*.*"
+  pull_request:
+    branches:
+      - main
+
+env:
+  AWS_REGION: ap-southeast-1
+  ECR_REGISTRY: ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.ap-southeast-1.amazonaws.com
+
+jobs:
+  # ──────────────────────────────────────────
+  # JOB 1: Test
+  # ──────────────────────────────────────────
+  test:
+    name: Lint & Unit Tests
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r api/requirements.txt -r api/requirements-dev.txt
+
+      - name: Lint (ruff)
+        run: ruff check api/
+
+      - name: Unit tests (pytest)
+        run: pytest api/tests/unit --tb=short
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: Install web dependencies
+        run: npm ci --prefix web
+
+      - name: Lint (eslint)
+        run: npm run lint --prefix web
+
+      - name: Unit tests (jest)
+        run: npm test --prefix web -- --passWithNoTests
+
+  # ──────────────────────────────────────────
+  # JOB 2: Build & Push Docker Images
+  # ──────────────────────────────────────────
+  build:
+    name: Build & Push to ECR
+    runs-on: ubuntu-latest
+    needs: test
+    if: github.event_name == 'push'
+
+    outputs:
+      image_tag: ${{ steps.meta.outputs.tag }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to ECR
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Set image tag
+        id: meta
+        run: |
+          SHA=$(echo $GITHUB_SHA | cut -c1-7)
+          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
+            TAG="${GITHUB_REF_NAME}"          # v1.2.3
+          elif [[ "$GITHUB_REF" == refs/heads/main ]]; then
+            TAG="staging-${SHA}"
+          else
+            TAG="dev-${SHA}"
+          fi
+          echo "tag=${TAG}" >> $GITHUB_OUTPUT
+
+      - name: Build & push API image
+        uses: docker/build-push-action@v5
+        with:
+          context: ./api
+          push: true
+          tags: |
+            ${{ env.ECR_REGISTRY }}/api:${{ steps.meta.outputs.tag }}
+            ${{ env.ECR_REGISTRY }}/api:latest
+
+      - name: Build & push Web image
+        uses: docker/build-push-action@v5
+        with:
+          context: ./web
+          push: true
+          tags: |
+            ${{ env.ECR_REGISTRY }}/web:${{ steps.meta.outputs.tag }}
+            ${{ env.ECR_REGISTRY }}/web:latest
+
+  # ──────────────────────────────────────────
+  # JOB 3: Deploy to Dev
+  # ──────────────────────────────────────────
+  deploy-dev:
+    name: Deploy → Dev
+    runs-on: ubuntu-latest
+    needs: build
+    if: startsWith(github.ref, 'refs/heads/feature/')
+    environment: dev
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (Dev account)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.DEV_AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.DEV_AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Update kubeconfig
+        run: aws eks update-kubeconfig --name app-cluster-dev --region ${{ env.AWS_REGION }}
+
+      - name: Helm deploy
+        run: |
+          helm upgrade --install app-api ./helm/api \
+            -f ./helm/api/values.dev.yaml \
+            --set image.tag=${{ needs.build.outputs.image_tag }} \
+            --namespace dev --create-namespace \
+            --wait --timeout 5m
+
+          helm upgrade --install app-web ./helm/web \
+            -f ./helm/web/values.dev.yaml \
+            --set image.tag=${{ needs.build.outputs.image_tag }} \
+            --namespace dev \
+            --wait --timeout 5m
+
+      - name: Smoke test
+        run: |
+          sleep 10
+          kubectl run smoke-test --image=curlimages/curl --rm -it --restart=Never \
+            -n dev -- curl -sf http://app-api/health
+        continue-on-error: false
+
+      - name: Rollback on failure
+        if: failure()
+        run: |
+          helm rollback app-api -n dev
+          helm rollback app-web -n dev
+
+  # ──────────────────────────────────────────
+  # JOB 4: Deploy to Staging
+  # ──────────────────────────────────────────
+  deploy-staging:
+    name: Deploy → Staging
+    runs-on: ubuntu-latest
+    needs: build
+    if: github.ref == 'refs/heads/main'
+    environment: staging
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (Staging account)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.STG_AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.STG_AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Update kubeconfig
+        run: aws eks update-kubeconfig --name app-cluster-staging --region ${{ env.AWS_REGION }}
+
+      - name: Helm deploy
+        run: |
+          helm upgrade --install app-api ./helm/api \
+            -f ./helm/api/values.staging.yaml \
+            --set image.tag=${{ needs.build.outputs.image_tag }} \
+            --namespace staging --create-namespace \
+            --wait --timeout 5m
+
+          helm upgrade --install app-web ./helm/web \
+            -f ./helm/web/values.staging.yaml \
+            --set image.tag=${{ needs.build.outputs.image_tag }} \
+            --namespace staging \
+            --wait --timeout 5m
+
+      - name: Integration tests
+        run: |
+          pip install pytest httpx
+          pytest tests/integration/ \
+            --base-url=https://staging.internal \
+            --tb=short
+
+      - name: Rollback on failure
+        if: failure()
+        run: |
+          helm rollback app-api -n staging
+          helm rollback app-web -n staging
+
+  # ──────────────────────────────────────────
+  # JOB 5: Deploy to Production (manual approval)
+  # ──────────────────────────────────────────
+  deploy-prod:
+    name: Deploy → Production
+    runs-on: ubuntu-latest
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    environment: production  # GitHub Environment with required reviewers
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (Prod account)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.PROD_AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.PROD_AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Update kubeconfig
+        run: aws eks update-kubeconfig --name app-cluster-prod --region ${{ env.AWS_REGION }}
+
+      - name: Helm deploy (Blue/Green via weighted ALB)
+        run: |
+          # Deploy Green (new version) alongside Blue (current)
+          helm upgrade --install app-api-green ./helm/api \
+            -f ./helm/api/values.prod.yaml \
+            --set image.tag=${{ needs.build.outputs.image_tag }} \
+            --set service.name=app-api-green \
+            --namespace prod --create-namespace \
+            --wait --timeout 10m
+
+      - name: Health check (5 minutes)
+        run: |
+          for i in $(seq 1 10); do
+            STATUS=$(kubectl run hc-$i --image=curlimages/curl --rm -it --restart=Never \
+              -n prod -- curl -sf -o /dev/null -w "%{http_code}" http://app-api-green/health)
+            if [ "$STATUS" != "200" ]; then
+              echo "Health check failed (attempt $i): HTTP $STATUS"
+              exit 1
+            fi
+            echo "Health check $i/10 passed"
+            sleep 30
+          done
+
+      - name: Shift traffic to Green
+        run: |
+          # อัพเดท ALB weighted target group ให้ส่ง traffic ไป Green 100%
+          aws elbv2 modify-rule \
+            --rule-arn ${{ secrets.PROD_ALB_RULE_ARN }} \
+            --actions Type=forward,ForwardConfig="{
+              TargetGroups=[
+                {TargetGroupArn=${{ secrets.PROD_TG_GREEN_ARN }},Weight=100},
+                {TargetGroupArn=${{ secrets.PROD_TG_BLUE_ARN }},Weight=0}
+              ]
+            }"
+
+      - name: Rollback to Blue on failure
+        if: failure()
+        run: |
+          echo "Deployment failed — rolling back to Blue"
+          aws elbv2 modify-rule \
+            --rule-arn ${{ secrets.PROD_ALB_RULE_ARN }} \
+            --actions Type=forward,ForwardConfig="{
+              TargetGroups=[
+                {TargetGroupArn=${{ secrets.PROD_TG_BLUE_ARN }},Weight=100},
+                {TargetGroupArn=${{ secrets.PROD_TG_GREEN_ARN }},Weight=0}
+              ]
+            }"
+          helm uninstall app-api-green -n prod
